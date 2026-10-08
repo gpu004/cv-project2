@@ -16,8 +16,8 @@ q4_started = time.perf_counter()
 DATA = Path("data/q4")
 OUT = Path("outputs/q4")
 OUT.mkdir(parents=True, exist_ok=True)
-WORK_SIZE = 900
-BG_MARGIN = 0.3
+WORK_SIZE = 1400
+BG_PADDING = 1.5
 PRIOR_THR = 0.55
 RETINEX_SIGMA = 40
 
@@ -90,20 +90,42 @@ def segment(img, clicks):
     for a, b in zip(pts[:-1], pts[1:], strict=True):
         cv2.line(path, tuple(map(int, a)), tuple(map(int, b)), 1, 3)
     fg_sp = np.unique(sp[path > 0])
-    m = BG_MARGIN * extent
+    padding = BG_PADDING * extent
     cx, cy = centers[:, 0], centers[:, 1]
-    bg_sp = np.nonzero((cx < x0 - m) | (cx > x1 + m) | (cy < y0 - m) | (cy > y1 + m))[0]
-    d_fg, d_bg = knn_dist(desc, desc[fg_sp]), knn_dist(desc, desc[bg_sp])
+    bg_sp = np.nonzero(
+        (cx < x0 - padding)
+        | (cx > x1 + padding)
+        | (cy < y0 - padding)
+        | (cy > y1 + padding)
+    )[0]
+    bg_ref_sp = bg_sp
+    if bg_ref_sp.size == 0:
+        bg_ref_sp = np.setdiff1d(np.arange(len(desc)), fg_sp)
+    d_fg, d_bg = knn_dist(desc, desc[fg_sp]), knn_dist(desc, desc[bg_ref_sp])
     prior = (d_bg / (d_fg + d_bg))[sp]
 
-    gc_mask = np.where(prior > PRIOR_THR, cv2.GC_PR_FGD, cv2.GC_PR_BGD).astype(np.uint8)
+    gc_mask = np.full(small.shape[:2], cv2.GC_PR_BGD, dtype=np.uint8)
+    gc_mask[prior > PRIOR_THR] = cv2.GC_PR_FGD
     gc_mask[np.isin(sp, bg_sp)] = cv2.GC_BGD
     for p in pts:
         cv2.circle(gc_mask, tuple(map(int, p)), int(0.02 * extent) + 3, cv2.GC_FGD, -1)
     bgd, fgd = np.zeros((1, 65)), np.zeros((1, 65))
-    cast(Q4Any, cv2).grabCut(
-        retinex(small, RETINEX_SIGMA), gc_mask, None, bgd, fgd, 6, cv2.GC_INIT_WITH_MASK
+    grab_cut = cast(Q4Any, cv2).grabCut
+    retinex_img = retinex(small, RETINEX_SIGMA)
+    grab_cut(retinex_img, gc_mask, None, bgd, fgd, 6, cv2.GC_INIT_WITH_MASK)
+    fg = np.isin(gc_mask, [cv2.GC_FGD, cv2.GC_PR_FGD])
+
+    lab, _ = ndi.label(fg)
+    keep = np.unique(lab[pts[:, 1], pts[:, 0]])
+    click_fg = np.isin(lab, keep[keep > 0])
+    recovery_radius = max(5, int(round(0.04 * extent)))
+    recovery_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (2 * recovery_radius + 1, 2 * recovery_radius + 1)
     )
+    recovery_region = cv2.dilate(click_fg.astype(np.uint8), recovery_kernel) > 0
+    recovery_ring = recovery_region & ~click_fg & (gc_mask == cv2.GC_PR_BGD)
+    gc_mask[recovery_ring] = cv2.GC_PR_FGD
+    grab_cut(retinex_img, gc_mask, None, bgd, fgd, 6, cv2.GC_INIT_WITH_MASK)
     fg = np.isin(gc_mask, [cv2.GC_FGD, cv2.GC_PR_FGD])
 
     lab, _ = ndi.label(fg)
